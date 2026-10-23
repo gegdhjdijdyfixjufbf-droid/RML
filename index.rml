@@ -1,0 +1,11 @@
+RML 0.0.2;
+
+Create.title1 ("My Website");
+Create.text ("Welcome to RML!");
+Create.image ("image.png");
+Create.link ("https://example.com");
+
+Create.script name=("main")
+    Display.Text ("Hello from SJ!")
+
+Create.text ("This is RML.");
