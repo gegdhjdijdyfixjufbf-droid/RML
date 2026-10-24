@@ -9,3 +9,10 @@ Create.script name=("main")
     Display.Text ("Hello from SJ!")
 
 Create.text ("This is RML.");
+
+Create.text ("You can now position text anywhere on the page using at=(x, y)!")
+ 
+Create.text ("LEFT") at=(20, 50);
+Create.text ("MIDDLE") at=(400, 50);
+Create.text ("FAR RIGHT") at=(750, 50);
+Create.text ("VERY FAR RIGHT") at=(1100, 50);
