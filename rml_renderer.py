@@ -11,9 +11,16 @@ from sj import SJ
 
 ROOT = Path(__file__).resolve().parent
 
+SUPPORTED_VERSIONS = {
+    "RML 0.0.1;",
+    "RML 0.0.2;",
+    "RML 0.0.3;",
+}
+
 COMMAND = re.compile(
     r'Create\.(title[1-6]|text|link|image)\s*'
-    r'\(\s*"((?:[^"\\]|\\.)*)"\s*\)\s*;',
+    r'\(\s*"((?:[^"\\]|\\.)*)"\s*\)\s*'
+    r'(?:at=\(\s*(\d+)\s*,\s*(\d+)\s*\)\s*)?;',
     re.IGNORECASE,
 )
 
@@ -31,6 +38,10 @@ TITLE_SIZES = {
     "title6": 15,
 }
 
+INITIAL_WIDTH = 900
+INITIAL_HEIGHT = 650
+PAGE_MARGIN = 32
+
 
 def unescape(value):
     return value.replace(r'\"', '"').replace(r'\\', '\\')
@@ -40,12 +51,10 @@ def parse_rml(filename):
     source = Path(filename).read_text(encoding="utf-8")
     lines = source.splitlines()
 
-    if not lines or lines[0].strip() not in (
-        "RML 0.0.1;",
-        "RML 0.0.2;",
-    ):
+    if not lines or lines[0].strip() not in SUPPORTED_VERSIONS:
         raise ValueError(
-            "First line must be RML 0.0.1; or RML 0.0.2;"
+            "The first line must be RML 0.0.1;, "
+            "RML 0.0.2;, or RML 0.0.3;"
         )
 
     version = lines[0].strip()
@@ -63,9 +72,9 @@ def parse_rml(filename):
         script_match = SCRIPT_START.fullmatch(line)
 
         if script_match:
-            if version != "RML 0.0.2;":
+            if version not in ("RML 0.0.2;", "RML 0.0.3;"):
                 raise ValueError(
-                    f"Line {line_number}: Scripts require RML 0.0.2."
+                    f"Line {line_number}: SJ scripts require RML 0.0.2 or 0.0.3."
                 )
 
             name = script_match.group(1)
@@ -85,7 +94,7 @@ def parse_rml(filename):
                 i += 1
 
             elements.append(
-                ("script", (name, "\n".join(script_lines)))
+                ("script", (name, "\n".join(script_lines)), None)
             )
             continue
 
@@ -96,82 +105,174 @@ def parse_rml(filename):
                 f"Line {line_number}: Invalid RML command:\n{line}"
             )
 
-        command, value = match.groups()
+        command, value, x, y = match.groups()
         command = command.lower()
         value = unescape(value)
 
+        position = None
+
+        if x is not None:
+            if version != "RML 0.0.3;":
+                raise ValueError(
+                    f"Line {line_number}: at=(x, y) requires RML 0.0.3."
+                )
+
+            position = (int(x), int(y))
+
         if command == "link":
             parsed = urlparse(value)
-            if parsed.scheme not in ("http", "https") or not parsed.netloc:
+
+            if (
+                parsed.scheme not in ("http", "https")
+                or not parsed.netloc
+            ):
                 raise ValueError(
-                    f"Line {line_number}: Link must be a valid "
+                    f"Line {line_number}: Links must use a valid "
                     "http:// or https:// URL."
                 )
 
-        elements.append((command, value))
+        elements.append((command, value, position))
 
     return elements
 
 
 class RMLRenderer:
     def __init__(self, filename):
-        self.root = tk.Tk()
-        self.root.geometry("900x650")
-        self.root.minsize(500, 350)
-
         self.filename = Path(filename).resolve()
+
+        self.root = tk.Tk()
+        self.root.geometry(f"{INITIAL_WIDTH}x{INITIAL_HEIGHT}")
+        self.root.minsize(500, 350)
         self.root.title(f"RML Renderer — {self.filename.name}")
 
+        self.images = []
+        self.page_width = INITIAL_WIDTH
+        self.page_height = INITIAL_HEIGHT
+
+        # Main container.
         container = tk.Frame(self.root)
         container.pack(fill="both", expand=True)
 
-        scrollbar = tk.Scrollbar(container)
-        scrollbar.pack(side="right", fill="y")
+        # Vertical scrollbar.
+        self.scrollbar = tk.Scrollbar(
+            container,
+            orient="vertical",
+        )
+        self.scrollbar.pack(side="right", fill="y")
 
+        # Scrollable canvas.
         self.canvas = tk.Canvas(
             container,
             background="white",
             highlightthickness=0,
-            yscrollcommand=scrollbar.set,
+            yscrollcommand=self.scrollbar.set,
         )
         self.canvas.pack(side="left", fill="both", expand=True)
-        scrollbar.config(command=self.canvas.yview)
 
-        self.page = tk.Frame(self.canvas, background="white")
+        self.scrollbar.config(command=self.canvas.yview)
+
+        # Page frame: placed elements do not automatically enlarge a frame,
+        # so page dimensions are managed explicitly below.
+        self.page = tk.Frame(
+            self.canvas,
+            background="white",
+            width=self.page_width,
+            height=self.page_height,
+        )
+        self.page.pack_propagate(False)
+
         self.page_window = self.canvas.create_window(
-            0, 0, anchor="nw", window=self.page
+            0,
+            0,
+            anchor="nw",
+            window=self.page,
+            width=self.page_width,
+            height=self.page_height,
         )
 
-        self.images = []
-
-        self.page.bind(
-            "<Configure>",
-            lambda event: self.canvas.configure(
-                scrollregion=self.canvas.bbox("all")
-            ),
-        )
-
-        self.canvas.bind(
-            "<Configure>",
-            lambda event: self.canvas.itemconfigure(
-                self.page_window, width=event.width
-            ),
-        )
+        self.canvas.bind("<Configure>", self.on_canvas_resize)
 
         self.root.bind_all(
             "<MouseWheel>",
-            lambda event: self.canvas.yview_scroll(
-                -int(event.delta / 120), "units"
-            ),
+            self.on_mousewheel,
         )
 
         try:
-            self.render(parse_rml(self.filename))
+            elements = parse_rml(self.filename)
+            self.render(elements)
         except (OSError, UnicodeError, ValueError) as error:
             self.show_error(str(error))
 
-    def render_text(self, value):
-        tk.Label(
+        self.update_page_size()
+
+    def on_mousewheel(self, event):
+        if event.delta:
+            self.canvas.yview_scroll(
+                -int(event.delta / 120),
+                "units",
+            )
+
+    def on_canvas_resize(self, event):
+        # Keep the page at least as wide and tall as the visible canvas.
+        self.page_width = max(self.page_width, event.width)
+        self.page_height = max(self.page_height, event.height)
+        self.update_page_size()
+
+    def update_page_size(self):
+        # Explicit dimensions prevent positioned widgets from being clipped
+        # when the page contains no packed elements.
+        self.page.configure(
+            width=self.page_width,
+            height=self.page_height,
+        )
+
+        self.canvas.itemconfigure(
+            self.page_window,
+            width=self.page_width,
+            height=self.page_height,
+        )
+
+        self.canvas.configure(
+            scrollregion=(
+                0,
+                0,
+                self.page_width,
+                self.page_height,
+            )
+        )
+
+    def add_widget(
+        self,
+        widget,
+        position=None,
+        padx=PAGE_MARGIN,
+        pady=6,
+    ):
+        if position is not None:
+            x, y = position
+
+            # Position is measured from the page's top-left corner.
+            widget.place(x=x, y=y, anchor="nw")
+            widget.update_idletasks()
+
+            right = x + widget.winfo_reqwidth() + PAGE_MARGIN
+            bottom = y + widget.winfo_reqheight() + PAGE_MARGIN
+
+            self.page_width = max(self.page_width, right)
+            self.page_height = max(self.page_height, bottom)
+        else:
+            # Elements without coordinates use normal vertical layout.
+            widget.pack(
+                anchor="w",
+                fill="x",
+                padx=padx,
+                pady=pady,
+            )
+
+        self.update_page_size()
+
+    def render_text(self, value, position=None):
+        widget = tk.Label(
             self.page,
             text=value,
             font=("Arial", 12),
@@ -180,14 +281,11 @@ class RMLRenderer:
             anchor="w",
             justify="left",
             wraplength=800,
-        ).pack(
-            anchor="w",
-            fill="x",
-            padx=32,
-            pady=6,
         )
 
-    def render_image(self, filename):
+        self.add_widget(widget, position)
+
+    def render_image(self, filename, position=None):
         image_path = Path(filename)
 
         if not image_path.is_absolute():
@@ -197,23 +295,27 @@ class RMLRenderer:
             image = tk.PhotoImage(file=str(image_path))
         except (tk.TclError, OSError) as error:
             self.show_error(
-                f"Could not load image:\n{image_path}\n\n{error}\n\n"
-                "Supported formats: PNG and GIF."
+                f"Could not load image:\n{image_path}\n\n"
+                f"{error}\n\nSupported formats: PNG and GIF."
             )
             return
 
+        # Keep a reference so Tkinter does not discard the image.
         self.images.append(image)
 
-        tk.Label(
+        widget = tk.Label(
             self.page,
             image=image,
             background="white",
-        ).pack(anchor="w", padx=32, pady=8)
+        )
+
+        self.add_widget(widget, position, pady=8)
 
     def render(self, elements):
-        for command, value in elements:
+        for command, value, position in elements:
             if command == "script":
                 name, code = value
+
                 try:
                     SJ(self.render_text).run(code)
                 except Exception as error:
@@ -228,7 +330,7 @@ class RMLRenderer:
                     weight="bold",
                 )
 
-                tk.Label(
+                widget = tk.Label(
                     self.page,
                     text=value,
                     font=font,
@@ -237,15 +339,16 @@ class RMLRenderer:
                     anchor="w",
                     justify="left",
                     wraplength=800,
-                ).pack(
-                    anchor="w",
-                    fill="x",
-                    padx=32,
+                )
+
+                self.add_widget(
+                    widget,
+                    position,
                     pady=(18, 4),
                 )
 
             elif command == "text":
-                self.render_text(value)
+                self.render_text(value, position)
 
             elif command == "link":
                 widget = tk.Label(
@@ -259,39 +362,45 @@ class RMLRenderer:
                     justify="left",
                     wraplength=800,
                 )
-                widget.pack(
-                    anchor="w",
-                    fill="x",
-                    padx=32,
-                    pady=6,
-                )
+
+                self.add_widget(widget, position)
+
                 widget.bind(
                     "<Button-1>",
                     lambda event, url=value: webbrowser.open(url),
                 )
 
             elif command == "image":
-                self.render_image(value)
+                self.render_image(value, position)
 
     def show_error(self, message):
-        tk.Label(
+        widget = tk.Label(
             self.page,
             text="RML / SJ Error",
             font=("Arial", 24, "bold"),
-            fg="#b00020",
-            bg="white",
-        ).pack(anchor="w", padx=24, pady=(24, 8))
+            foreground="#b00020",
+            background="white",
+        )
+        widget.pack(anchor="w", padx=24, pady=(24, 8))
 
-        tk.Label(
+        details = tk.Label(
             self.page,
             text=message,
             font=("Consolas", 11),
-            fg="#222222",
-            bg="white",
+            foreground="#222222",
+            background="white",
             justify="left",
             anchor="w",
             wraplength=800,
-        ).pack(anchor="w", padx=24, pady=8)
+        )
+        details.pack(anchor="w", padx=24, pady=8)
+
+        self.page_width = max(self.page_width, 850)
+        self.page_height = max(
+            self.page_height,
+            details.winfo_reqheight() + 100,
+        )
+        self.update_page_size()
 
     def run(self):
         self.root.mainloop()
